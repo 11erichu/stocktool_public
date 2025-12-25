@@ -6,45 +6,63 @@ import os
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 屏蔽代理
+# 环境配置
 os.environ['http_proxy'] = ''
 os.environ['https_proxy'] = ''
 
 st.set_page_config(page_title="DKX 极速多因子选股器", layout="wide")
 
-# --- 1. 数据抓取与缓存 ---
+# --- 1. 数据抓取与缓存 (加固版) ---
 @st.cache_data(ttl=3600)
 def get_stock_pool_data(pool_type):
     """获取名单和基本面混合数据"""
     try:
-        # 获取实时行情（含市值）
+        # 获取实时行情快照 (最稳定的接口)
         df_spot = ak.stock_zh_a_spot_em()
+        if df_spot.empty: return pd.DataFrame()
+        
         df_spot['total_mv_billion'] = df_spot['总市值'] / 1e8
         
-        # 获取最新季度业绩报表 (营收增长、净利润)
-        # 自动尝试最新年份，若报错则退回上一个季度
+        # 尝试获取业绩报表
         try:
-            df_finance = ak.stock_yjbb_em(date="20241231")
-        except:
-            df_finance = ak.stock_yjbb_em(date="20240930")
+            # 动态尝试最近两个季度的报表
+            current_year = datetime.now().year
+            df_finance = pd.DataFrame()
+            for date_str in [f"{current_year-1}1231", f"{current_year-1}0930"]:
+                try:
+                    df_finance = ak.stock_yjbb_em(date=date_str)
+                    if not df_finance.empty: break
+                except: continue
             
-        df_finance = df_finance[['股票代码', '营业收入-同比增长', '净利润-净利润']]
-        df_finance.columns = ['代码', '营收同比', '净利润(亿)']
-        df_finance['净利润(亿)'] = df_finance['净利润(亿)'] / 1e8
-        
-        # 合并行情与财务
-        df_combined = pd.merge(df_spot, df_finance, on='代码', how='left')
-        
+            if not df_finance.empty:
+                df_finance = df_finance[['股票代码', '营业收入-同比增长', '净利润-净利润']]
+                df_finance.columns = ['代码', '营收同比', '净利润(亿)']
+                df_finance['净利润(亿)'] = df_finance['净利润(亿)'] / 1e8
+                df_combined = pd.merge(df_spot, df_finance, on='代码', how='left')
+            else:
+                df_combined = df_spot
+                df_combined['营收同比'] = np.nan
+                df_combined['净利润(亿)'] = np.nan
+        except:
+            df_combined = df_spot
+            df_combined['营收同比'] = np.nan
+            df_combined['净利润(亿)'] = np.nan
+
         # 过滤股票池成员
         if pool_type == "沪深300":
-            cons = ak.index_stock_cons_weight_csindex(symbol="000300")
-            df_combined = df_combined[df_combined['代码'].isin(cons['成分券代码'].tolist())]
+            try:
+                cons = ak.index_stock_cons_weight_csindex(symbol="000300")
+                df_combined = df_combined[df_combined['代码'].isin(cons['成分券代码'].tolist())]
+            except: pass
         elif pool_type == "中证500":
-            cons = ak.index_stock_cons_weight_csindex(symbol="000905")
-            df_combined = df_combined[df_combined['代码'].isin(cons['成分券代码'].tolist())]
+            try:
+                cons = ak.index_stock_cons_weight_csindex(symbol="000905")
+                df_combined = df_combined[df_combined['代码'].isin(cons['成分券代码'].tolist())]
+            except: pass
             
         return df_combined
-    except:
+    except Exception as e:
+        st.error(f"底层接口异常: {e}")
         return pd.DataFrame()
 
 # --- 2. 算法引擎 ---
@@ -61,10 +79,18 @@ def calculate_dkx_logic(df, n, m):
 def scan_worker(row, n, m, limit, mode, adj, start_date):
     try:
         code = row['代码']
-        df_hist = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust=adj)
+        # 增加请求重试机制
+        df_hist = pd.DataFrame()
+        for _ in range(2): 
+            try:
+                df_hist = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust=adj)
+                if not df_hist.empty: break
+            except: continue
+            
         if len(df_hist) < (n + m + 2): return None
         df_hist = calculate_dkx_logic(df_hist, n, m)
         last = df_hist.iloc[-1]
+        
         diff = abs(last['dkx'] - last['madkx'])
         raw_diff = last['dkx'] - last['madkx']
         
@@ -75,17 +101,17 @@ def scan_worker(row, n, m, limit, mode, adj, start_date):
         return {
             "代码": code, "名称": row['名称'], "现价": last['close'],
             "DKX": round(last['dkx'], 3), "MADKX": round(last['madkx'], 3),
-            "绝对差值": round(diff, 4), "营收同比%": row['营收同比'],
-            "净利润(亿)": round(row['净利润(亿)'], 2), "日期": last['date']
+            "绝对差值": round(diff, 4), "营收同比%": row.get('营收同比', np.nan),
+            "净利润(亿)": round(row.get('净利润(亿)', 0), 2), "日期": last['date']
         }
     except: return None
 
 # --- 3. UI 界面 ---
-st.title("🏹 DKX & 财务因子综合选股")
+st.title("🏹 DKX 极速多因子选股器")
 
 with st.sidebar:
     st.header("🎯 指标精度设置")
-    limit_val = st.number_input("DKX差值阈值 (精度0.01)", min_value=0.001, value=0.050, step=0.010, format="%.3f")
+    limit_val = st.number_input("DKX差值阈值", min_value=0.001, value=0.050, step=0.010, format="%.3f")
     mode_val = st.selectbox("DKX形态", ["全部满足", "即将上穿", "已经上穿"])
     
     st.header("📊 财务因子筛选")
@@ -105,22 +131,23 @@ if st.button("🚀 开始极速多因子扫描", type="primary"):
         data_all = get_stock_pool_data(pool)
         
         if data_all.empty:
-            st.error("数据抓取异常，请重试")
+            st.error("无法连接到数据源，请检查网络或稍后再试。")
             st.stop()
             
-        # 执行财务与市值预筛选
         st.write("🧪 正在执行财务因子过滤...")
-        pre_filtered = data_all[
-            (data_all['total_mv_billion'].between(mv_range[0], mv_range[1])) &
-            ((data_all['营收同比'] >= min_rev) | (data_all['营收同比'].isna())) & # 读不到财报的默认通过或根据原则跳过
-            ((data_all['净利润(亿)'] >= min_profit) | (data_all['净利润(亿)'].isna()))
-        ]
-        
+        # 优化预筛选：如果某列不存在则跳过该条件
+        mask = data_all['total_mv_billion'].between(mv_range[0], mv_range[1])
+        if '营收同比' in data_all.columns:
+            mask &= ((data_all['营收同比'] >= min_rev) | (data_all['营收同比'].isna()))
+        if '净利润(亿)' in data_all.columns:
+            mask &= ((data_all['净利润(亿)'] >= min_profit) | (data_all['净利润(亿)'].isna()))
+            
+        pre_filtered = data_all[mask]
         st.write(f"✅ 进入技术面复核: {len(pre_filtered)} 只")
         
         results = []
         progress = st.progress(0)
-        with ThreadPoolExecutor(max_workers=6) as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             futures = [executor.submit(scan_worker, row, 20, 10, limit_val, mode_val, adj_val, start_dt) for _, row in pre_filtered.iterrows()]
             for i, f in enumerate(as_completed(futures)):
                 res = f.result()
@@ -130,8 +157,7 @@ if st.button("🚀 开始极速多因子扫描", type="primary"):
         status.update(label=f"分析完毕! 找到 {len(results)} 只个股", state="complete")
 
     if results:
-        st.balloons()
         df_res = pd.DataFrame(results).sort_values(by="绝对差值")
         st.dataframe(df_res, use_container_width=True)
     else:
-        st.warning("在此严苛条件下未找到匹配个股，建议降低财务要求或增大差值阈值。")
+        st.warning("在此条件下未找到匹配个股。")
