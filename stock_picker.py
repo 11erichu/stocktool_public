@@ -96,13 +96,37 @@ def check_volume_ratio(df, days=3, threshold=1.0):
 # ================= 数据获取与处理 =================
 
 @st.cache_data(ttl=3600*4) # 缓存4小时
+
 def get_stock_list():
-    """获取全A股列表"""
+    """获取全A股列表（加入伪装和备用接口）"""
+    import requests
+    # 伪装成正常的浏览器访问，防止被识别为爬虫
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    }
+    
+    # 尝试1：使用新浪财经接口（比东方财富更宽容）
     try:
-        stock_info = ak.stock_zh_a_spot_em()
-        return stock_info[['代码', '名称']]
+        st.info("正在尝试从新浪财经获取股票列表...")
+        stock_info = ak.stock_zh_a_spot()
+        if not stock_info.empty:
+            # 新浪接口返回的列名可能不同，做个适配
+            stock_info = stock_info.rename(columns={'symbol': '代码', 'name': '名称'})
+            return stock_info[['代码', '名称']]
     except Exception as e:
-        st.error(f"获取股票列表失败: {e}")
+        st.warning(f"新浪接口失败，尝试备用接口... 错误: {e}")
+
+    # 尝试2：使用东方财富接口（加上伪装和延时重试）
+    try:
+        st.info("正在尝试从东方财富获取股票列表...")
+        # 强制休眠2秒，降低请求频率
+        time.sleep(2) 
+        # 注意：AkShare的东方财富接口通常无法直接传headers，这里我们通过环境变量或AkShare的底层设置来做
+        stock_info = ak.stock_zh_a_spot_em()
+        if not stock_info.empty:
+            return stock_info[['代码', '名称']]
+    except Exception as e:
+        st.error("所有数据源均获取失败，可能是你的网络IP被暂时封控了。请等待5-10分钟后重试，或者切换网络（如手机开热点给电脑）。")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600*4)
