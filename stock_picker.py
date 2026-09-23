@@ -4,7 +4,31 @@ import pandas as pd
 import numpy as np
 import datetime
 import time
+import os
+# 强制忽略代理
+os.environ['NO_PROXY'] = '*'
+os.environ['HTTP_PROXY'] = ''
+os.environ['HTTPS_PROXY'] = ''
 
+import streamlit as st
+import akshare as ak
+# ... 其他代码
+
+# 并且在获取数据的地方，增加防报错机制：
+@st.cache_data(ttl=3600*4)
+def get_stock_list():
+    try:
+        # 尝试用AkShare获取
+        stock_info = ak.stock_zh_a_spot_em()
+        return stock_info[['代码', '名称']]
+    except Exception as e:
+        # 如果失败，尝试用新浪接口替代（或者提示用户重试）
+        st.warning(f"从东方财富获取失败，尝试其他源... 错误: {e}")
+        try:
+            stock_info = ak.stock_zh_a_spot()  # 备用接口
+            return stock_info[['代码', '名称']]
+        except:
+            return pd.DataFrame()
 # ================= 页面配置 (手机端适配) =================
 st.set_page_config(layout="wide", page_title="A股多周期选股器", page_icon="📈")
 
