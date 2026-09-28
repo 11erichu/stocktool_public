@@ -80,6 +80,9 @@ def resample_data(df, period='W'):
 @st.cache_data(ttl=3600*24)  # 缓存24小时，避免重复请求
 def get_stock_list(token):
     """获取全A股列表"""
+    # ⚠️ 关键修复：全局设置 Token，确保 pro_bar 也能读取到
+    ts.set_token(token) 
+    
     pro = ts.pro_api(token)
     try:
         df = pro.stock_basic(exchange='', list_status='L', fields='symbol,name')
