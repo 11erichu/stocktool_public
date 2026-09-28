@@ -29,6 +29,7 @@ if not os.path.exists(DATA_DIR):
 
 def calculate_dkx_logic(df, n=10, m=10):
     """根据用户提供的算法计算DKX和MADKX"""
+    # 重命名为英文进行计算
     df = df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low'})
     df['mid'] = (3 * df['close'] + df['low'] + df['open'] + df['high']) / 6
     weights = np.arange(n, 0, -1)
@@ -36,6 +37,9 @@ def calculate_dkx_logic(df, n=10, m=10):
     def dkx_val(s): return np.dot(s, weights[::-1]) / sum_w if len(s) == n else np.nan
     df['DKX'] = df['mid'].rolling(window=n).apply(dkx_val, raw=True)
     df['MADKX'] = df['DKX'].rolling(window=m).mean()
+    
+    # ===== 关键修复：把列名改回中文，供后续计算使用 =====
+    df = df.rename(columns={'date': '日期', 'open': '开盘', 'close': '收盘', 'high': '最高', 'low': '最低'})
     return df
 
 def calculate_macd(df, short=12, long=26, mid=9):
@@ -115,7 +119,7 @@ def fetch_and_update_stock(code, token):
     # 数据清洗与合并
     df_new = df_new.rename(columns={'trade_date': '日期', 'open': '开盘', 'close': '收盘', 'high': '最高', 'low': '最低', 'vol': '成交量'})
     df_new['日期'] = pd.to_datetime(df_new['日期'])
-    df_new = df_new.sort_index()
+    df_new = df_new.sort_values(by='日期')
     df_new = df_new[['日期', '开盘', '收盘', '最高', '最低', '成交量']]
 
     if os.path.exists(file_path):
