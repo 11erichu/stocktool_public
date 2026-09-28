@@ -25,138 +25,130 @@ DATA_DIR = "stock_data"
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-# ================= 核心指标计算 =================
+# ================= 核心指标计算 (纯英文列名，防错乱) =================
 
-def calculate_dkx_logic(df, n=10, m=10):
-    """根据用户提供的算法计算DKX和MADKX"""
-    # 重命名为英文进行计算
-    df = df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low'})
+def compute_dkx_macd_ma(df):
+    """接收包含 date, open, close, high, low, volume 的DataFrame，计算所有指标"""
+    # 1. DKX & MADKX (采用你提供的严谨算法)
+    n, m = 10, 10
     df['mid'] = (3 * df['close'] + df['low'] + df['open'] + df['high']) / 6
     weights = np.arange(n, 0, -1)
     sum_w = np.sum(weights)
     def dkx_val(s): return np.dot(s, weights[::-1]) / sum_w if len(s) == n else np.nan
     df['DKX'] = df['mid'].rolling(window=n).apply(dkx_val, raw=True)
     df['MADKX'] = df['DKX'].rolling(window=m).mean()
-    
-    # ===== 关键修复：把列名改回中文，供后续计算使用 =====
-    df = df.rename(columns={'date': '日期', 'open': '开盘', 'close': '收盘', 'high': '最高', 'low': '最低'})
-    return df
 
-def calculate_macd(df, short=12, long=26, mid=9):
-    """计算MACD"""
-    ema_short = df['收盘'].ewm(span=short, adjust=False).mean()
-    ema_long = df['收盘'].ewm(span=long, adjust=False).mean()
+    # 2. MACD
+    ema_short = df['close'].ewm(span=12, adjust=False).mean()
+    ema_long = df['close'].ewm(span=26, adjust=False).mean()
     dif = ema_short - ema_long
-    dea = dif.ewm(span=mid, adjust=False).mean()
+    dea = dif.ewm(span=9, adjust=False).mean()
     df['MACD'] = (dif - dea) * 2
-    return df
 
-def calculate_ma(df):
-    """计算均线"""
+    # 3. 均线
     for period in [5, 10, 20, 30, 60]:
-        df[f'MA{period}'] = df['收盘'].rolling(window=period).mean()
-    return df
+        df[f'MA{period}'] = df['close'].rolling(window=period).mean()
 
-def calculate_volume_ratio(df):
-    """计算量比"""
-    vol_ma5 = df['成交量'].shift(1).rolling(5).mean()
-    df['量比'] = df['成交量'] / vol_ma5
+    # 4. 量比
+    vol_ma5 = df['volume'].shift(1).rolling(5).mean()
+    df['量比'] = df['volume'] / vol_ma5
+
     return df
 
 def resample_data(df, period='W'):
-    """重采样生成周线或月线"""
-    resampled = df.resample(period).agg({
-        '开盘': 'first', '收盘': 'last', '最高': 'max', '最低': 'min', '成交量': 'sum'
+    """重采样生成周线或月线。df 需为中文列名"""
+    df_reset = df.reset_index()
+    # 转英文
+    df_reset = df_reset.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume'})
+    df_reset = df_reset.set_index('date')
+    
+    # 重采样
+    resampled = df_reset.resample(period).agg({
+        'open': 'first', 'close': 'last', 'high': 'max', 'low': 'min', 'volume': 'sum'
     }).dropna()
-    # 为周线月线重新计算DKX和MACD
-    resampled = calculate_dkx_logic(resampled)
-    resampled = calculate_macd(resampled)
+    
+    # 计算指标
+    resampled = compute_dkx_macd_ma(resampled)
+    
+    # 转回中文
+    resampled = resampled.rename(columns={'open': '开盘', 'close': '收盘', 'high': '最高', 'low': '最低', 'volume': '成交量'})
     return resampled
 
 # ================= 数据获取与存储 =================
 
+@st.cache_data(ttl=3600*24)
 def get_stock_list(token):
-    """获取全A股列表"""
     pro = ts.pro_api(token)
     try:
         df = pro.stock_basic(exchange='', list_status='L', fields='symbol,name')
-        df = df.rename(columns={'symbol': '代码', 'name': '名称'})
-        return df
+        return df.rename(columns={'symbol': '代码', 'name': '名称'})
     except Exception as e:
         st.error(f"获取股票列表失败: {e}")
         return pd.DataFrame()
 
 def fetch_and_update_stock(code, token):
-    """增量更新单只股票的数据，并保存到Excel"""
+    """增量更新单只股票，保存至Excel"""
     ts_code = code + '.SZ' if code.startswith(('0', '3')) else code + '.SH'
     file_path = os.path.join(DATA_DIR, f"{code}.xlsx")
-    
     end_date = datetime.datetime.now().strftime('%Y%m%d')
     
-    # 判断是否需要增量更新
+    # 判断增量起始日期
     if os.path.exists(file_path):
         try:
             df_old = pd.read_excel(file_path, sheet_name='日线')
-            if df_old.empty:
-                start_date = (datetime.datetime.now() - datetime.timedelta(days=3*365)).strftime('%Y%m%d')
-            else:
-                df_old['日期'] = pd.to_datetime(df_old['日期'])
-                last_date = df_old['日期'].max()
-                # 为了防止前复权数据错乱，每次更新拉取最近一年数据覆盖
-                start_date = (last_date - datetime.timedelta(days=365)).strftime('%Y%m%d')
-        except Exception:
+            df_old['日期'] = pd.to_datetime(df_old['日期'])
+            last_date = df_old['日期'].max()
+            # 为了防止前复权数据错乱，每次更新拉取最近一年数据覆盖
+            start_date = (last_date - datetime.timedelta(days=365)).strftime('%Y%m%d')
+        except:
             start_date = (datetime.datetime.now() - datetime.timedelta(days=3*365)).strftime('%Y%m%d')
     else:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=3*365)).strftime('%Y%m%d')
 
-    # 调用Tushare获取数据 (pro_bar 需要全局token)
     ts.set_token(token)
     df_new = ts.pro_bar(ts_code=ts_code, start_date=start_date, end_date=end_date, adj='qfq')
     
     if df_new is None or df_new.empty:
         return None
 
-    # 数据清洗与合并
+    # 数据清洗，统一使用中文列名
     df_new = df_new.rename(columns={'trade_date': '日期', 'open': '开盘', 'close': '收盘', 'high': '最高', 'low': '最低', 'vol': '成交量'})
     df_new['日期'] = pd.to_datetime(df_new['日期'])
-    df_new = df_new.sort_values(by='日期')
+    df_new = df_new.sort_values('日期')
     df_new = df_new[['日期', '开盘', '收盘', '最高', '最低', '成交量']]
 
+    # 合并旧数据
     if os.path.exists(file_path):
-        try:
-            df_old = pd.read_excel(file_path, sheet_name='日线')
-            df_old['日期'] = pd.to_datetime(df_old['日期'])
-            # 合并去重，保留新数据
-            df_combined = pd.concat([df_old, df_new]).drop_duplicates(subset=['日期'], keep='last')
-        except Exception:
-            df_combined = df_new
+        df_old = pd.read_excel(file_path, sheet_name='日线')
+        df_old['日期'] = pd.to_datetime(df_old['日期'])
+        df_combined = pd.concat([df_old, df_new]).drop_duplicates(subset=['日期'], keep='last')
     else:
         df_combined = df_new
 
     df_combined = df_combined.sort_values('日期').set_index('日期')
-
-    # 计算日线指标
-    df_combined = calculate_dkx_logic(df_combined.reset_index()).set_index('日期')
-    df_combined = calculate_macd(df_combined)
-    df_combined = calculate_ma(df_combined)
-    df_combined = calculate_volume_ratio(df_combined)
-
+    
+    # 计算指标（转为英文列名计算）
+    df_calc = df_combined.reset_index().rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume'})
+    df_calc = compute_dkx_macd_ma(df_calc)
+    
+    # 最终输出的日线数据转回中文
+    df_final = df_calc.rename(columns={'date': '日期', 'open': '开盘', 'close': '收盘', 'high': '最高', 'low': '最低', 'volume': '成交量'})
+    
     # 生成周线、月线
-    df_weekly = resample_data(df_combined, 'W-FRI')
-    df_monthly = resample_data(df_combined, 'ME')
+    df_weekly = resample_data(df_final, 'W-FRI')
+    df_monthly = resample_data(df_final, 'ME')
 
     # 写入Excel
     with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-        df_combined.reset_index().to_excel(writer, sheet_name='日线', index=False)
-        df_weekly.reset_index().to_excel(writer, sheet_name='周线', index=False)
-        df_monthly.reset_index().to_excel(writer, sheet_name='月线', index=False)
+        df_final.to_excel(writer, sheet_name='日线', index=False)
+        df_weekly.to_excel(writer, sheet_name='周线', index=False)
+        df_monthly.to_excel(writer, sheet_name='月线', index=False)
 
     return True
 
 # ================= 选股逻辑 =================
 
 def check_dkx_cross(df, mode="已经上穿", limit=0.05):
-    """检查DKX金叉状态"""
     if len(df) < 2: return False
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -170,12 +162,10 @@ def check_dkx_cross(df, mode="已经上穿", limit=0.05):
     if mode == "即将上穿":
         return raw_diff < 0 and diff <= limit
     elif mode == "已经上穿":
-        # 判断前一日在下方，今日在上方
         return prev['DKX'] <= prev['MADKX'] and raw_diff > 0
     return False
 
 def check_macd_increasing(df, periods=3):
-    """检查MACD连续递增"""
     if len(df) < periods + 1: return False
     macd_hist = df['MACD'].dropna()
     if len(macd_hist) < periods + 1: return False
@@ -186,7 +176,6 @@ def check_macd_increasing(df, periods=3):
     return True
 
 def check_volume_ratio_increase(df, days=3, threshold=1.0):
-    """检查量比连续大于1"""
     if len(df) < 6: return False
     recent_ratio = df['量比'].tail(days)
     return all(recent_ratio > threshold)
@@ -231,9 +220,6 @@ if update_btn:
         stock_list = get_stock_list(token_input)
         if stock_list.empty: st.stop()
         
-        # 为了演示，这里只更新前20只股票，实际使用请去掉head
-        # stock_list = stock_list.head(20) 
-        
         total = len(stock_list)
         st.info(f"开始增量更新 {total} 只股票数据，存入Excel...")
         progress = st.progress(0)
@@ -243,7 +229,7 @@ if update_btn:
             progress.progress((idx+1)/total)
             status.text(f"更新: {row['名称']} ({row['代码']}) - {idx+1}/{total}")
             fetch_and_update_stock(row['代码'], token_input)
-            time.sleep(0.3)  # Tushare频率限制
+            time.sleep(0.3) # 防止Tushare触发频率限制
             
         status.text("数据更新完成！")
         progress.empty()
