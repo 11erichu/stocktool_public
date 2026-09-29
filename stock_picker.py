@@ -214,6 +214,7 @@ if update_btn:
         else:
             st.success(f"成功下载 {success_count} 只股票的完整历史数据！")
 
+
 # 选股逻辑
 if execute_btn:
     if not token_input: st.warning("请先输入Tushare Token！")
@@ -221,26 +222,47 @@ if execute_btn:
         stock_list = get_stock_list(token_input)
         if stock_list.empty: st.stop()
         
-        # 预获取市值和ST数据
-        with st.spinner("正在获取初步筛选数据（市值、ST状态）..."):
+        # ================= 关键修改：在循环外先进行初步筛选 =================
+        with st.spinner("正在进行初步筛选（市值、ST状态）..."):
             try:
                 pro = ts.pro_api(token_input)
                 today = datetime.datetime.now().strftime('%Y%m%d')
-                # 获取市值
+                
+                # 1. 获取市值
                 mv_df = pro.daily_basic(trade_date=today, fields='ts_code,total_mv')
-                mv_dict = dict(zip(mv_df['ts_code'].str[:6], mv_df['total_mv'])) if mv_df is not None and not mv_df.empty else {}
-                # 获取ST
+                if mv_df is not None and not mv_df.empty:
+                    mv_df['代码'] = mv_df['ts_code'].str[:6]
+                    mv_dict = dict(zip(mv_df['代码'], mv_df['total_mv']))
+                else:
+                    mv_dict = {}
+                
+                # 2. 获取ST名单 (直接通过名称过滤)
                 if exclude_st:
                     st_df = pro.stock_basic(exchange='', list_status='L', fields='symbol,name')
                     st_codes = set(st_df[st_df['name'].str.contains('ST')]['symbol'].tolist())
                 else:
                     st_codes = set()
+                    
             except Exception as e:
                 st.warning(f"获取市值或ST数据失败（可能是积分不足），将跳过初步筛选。错误：{e}")
                 mv_dict, st_codes = {}, set()
-        
+
+            # 过滤 ST 股票
+            if exclude_st and st_codes:
+                stock_list = stock_list[~stock_list['代码'].isin(st_codes)]
+            
+            # 过滤市值范围
+            if mv_dict:
+                # 给 stock_list 加上市值列
+                stock_list['市值(万元)'] = stock_list['代码'].map(mv_dict)
+                # 剔除没有市值的股票（比如新股）
+                stock_list = stock_list.dropna(subset=['市值(万元)'])
+                # 按照市值范围筛选
+                stock_list = stock_list[(stock_list['市值(万元)'] >= min_mv) & (stock_list['市值(万元)'] <= max_mv)]
+
+        # 此时总数已经是过滤后的数量了
         total = len(stock_list)
-        st.info(f"正在从本地Excel读取并筛选 {total} 只股票...")
+        st.info(f"经过初步筛选后，共需扫描 {total} 只股票...")
         progress = st.progress(0)
         status = st.empty()
         results = []
@@ -250,12 +272,6 @@ if execute_btn:
             progress.progress((idx+1)/total)
             status.text(f"筛选: {name} ({code}) - {idx+1}/{total}")
             
-            # 初步筛选
-            if exclude_st and code in st_codes: continue
-            if mv_dict:
-                mv = mv_dict.get(code, 0)
-                if not (min_mv <= mv <= max_mv): continue
-                
             file_path = os.path.join(DATA_DIR, f"{code}.xlsx")
             if not os.path.exists(file_path): continue
                 
