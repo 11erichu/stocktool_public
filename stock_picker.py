@@ -215,34 +215,60 @@ if update_btn:
             st.success(f"成功下载 {success_count} 只股票的完整历史数据！")
 
 
-# 选股逻辑
+# ================= 选股逻辑 =================
 if execute_btn:
-    if not token_input: st.warning("请先输入Tushare Token！")
+    if not token_input: 
+        st.warning("请先输入Tushare Token！")
     else:
         stock_list = get_stock_list(token_input)
-        if stock_list.empty: st.stop()
+        if stock_list.empty: 
+            st.stop()
         
-        # ================= 关键修复：精确获取最新交易日 =================
+        # ================= 关键修复：获取数据与初步筛选 =================
         with st.spinner("正在获取最新交易日及初步筛选数据..."):
             pro = ts.pro_api(token_input)
             
-            # 1. 获取最近的交易日（防止周末或节假日获取不到数据）
+            # 1. 获取最近的交易日（防止周末、节假日或数据未更新）
             today_str = datetime.datetime.now().strftime('%Y%m%d')
-            start_search = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime('%Y%m%d')
+            start_search = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime('%Y%m%d')
             cal_df = pro.trade_cal(exchange='SSE', is_open='1', start_date=start_search, end_date=today_str)
             latest_trade_date = cal_df['cal_date'].max() if cal_df is not None and not cal_df.empty else today_str
             
             st.info(f"使用最近交易日: {latest_trade_date} 获取市值与ST数据...")
 
-            # 2. 获取市值
-            mv_df = pro.daily_basic(trade_date=latest_trade_date, fields='ts_code,total_mv')
+            # 2. 获取市值 (增加日期回退和权限甄别机制)
+            mv_dict = {}
+            mv_df = None
+            
+            try:
+                mv_df = pro.daily_basic(trade_date=latest_trade_date, fields='ts_code,total_mv')
+            except Exception as e:
+                error_msg = str(e)
+                if "权限" in error_msg or "积分" in error_msg or "40203" in error_msg:
+                    st.error(f"⚠️ 权限不足：你的账号没有调用 daily_basic 接口的权限。错误信息：{error_msg}")
+                else:
+                    st.error(f"⚠️ 接口请求异常：{error_msg}")
+
+            # 如果当天数据为空（说明数据还没更新），回退到前一个交易日
+            if mv_df is None or mv_df.empty:
+                st.warning(f"提示：{latest_trade_date} 的市值数据尚未生成（通常收盘后需等待1-2小时更新）。正在尝试向前寻找上一个交易日的数据...")
+                cal_df_prev = cal_df[cal_df['cal_date'] < latest_trade_date]
+                if not cal_df_prev.empty:
+                    prev_trade_date = cal_df_prev['cal_date'].max()
+                    try:
+                        mv_df = pro.daily_basic(trade_date=prev_trade_date, fields='ts_code,total_mv')
+                        if mv_df is not None and not mv_df.empty:
+                            st.success(f"已回退使用 {prev_trade_date} 的市值数据。")
+                    except Exception:
+                        pass
+
+            # 处理获取到的市值数据
             if mv_df is not None and not mv_df.empty:
                 mv_df['代码'] = mv_df['ts_code'].str[:6]
                 mv_dict = dict(zip(mv_df['代码'], mv_df['total_mv']))
             else:
-                mv_dict = {}
-                st.error(f"⚠️ 无法获取 {latest_trade_date} 的市值数据，请检查 Tushare 积分权限（daily_basic需2000积分）。")
-            
+                st.warning("⚠️ 未能获取近期的市值数据。为了不中断选股，已自动跳过市值筛选，将基于 Excel 中最新的历史数据继续计算。")
+
             # 3. 获取ST名单
             if exclude_st:
                 st_df = pro.stock_basic(exchange='', list_status='L', fields='symbol,name')
@@ -250,7 +276,7 @@ if execute_btn:
             else:
                 st_codes = set()
 
-            # 4. 执行筛选
+            # 4. 执行初步筛选
             original_count = len(stock_list)
             
             if exclude_st and st_codes:
@@ -261,9 +287,9 @@ if execute_btn:
                 stock_list = stock_list.dropna(subset=['市值(万元)'])
                 stock_list = stock_list[(stock_list['市值(万元)'] >= min_mv) & (stock_list['市值(万元)'] <= max_mv)]
             else:
-                st.warning("未成功获取市值数据，已跳过市值筛选！")
+                pass # 保持原有列表，跳过市值筛选
 
-        # 此时总数已经是过滤后的数量了
+        # ================= 初步筛选完成，开始正式选股 =================
         total = len(stock_list)
         st.success(f"初步筛选完成：从 {original_count} 只股票中筛选出 {total} 只符合市值/ST条件的股票。")
         
@@ -280,44 +306,63 @@ if execute_btn:
             progress.progress((idx+1)/total)
             status.text(f"筛选: {name} ({code}) - {idx+1}/{total}")
             
-            # 下面保留你原有的选股逻辑
             file_path = os.path.join(DATA_DIR, f"{code}.xlsx")
-            if not os.path.exists(file_path): continue
+            if not os.path.exists(file_path): 
+                continue
                 
             try:
                 df_daily = pd.read_excel(file_path, sheet_name='日线')
                 df_weekly = pd.read_excel(file_path, sheet_name='周线')
                 df_monthly = pd.read_excel(file_path, sheet_name='月线')
                 
-                if len(df_daily) < 60 or len(df_weekly) < 30 or len(df_monthly) < 10: continue
+                if len(df_daily) < 60 or len(df_weekly) < 30 or len(df_monthly) < 10: 
+                    continue
                     
                 match = True
                 reasons = []
                 
                 if cond1:
-                    if check_dkx_cross(df_daily, mode1): reasons.append(f"日线金叉({mode1})")
-                    else: match = False
+                    if check_dkx_cross(df_daily, mode1): 
+                        reasons.append(f"日线金叉({mode1})")
+                    else: 
+                        match = False
+                        
                 if match and cond2:
-                    if check_dkx_cross(df_weekly, "已经上穿"): reasons.append("周线金叉")
-                    else: match = False
+                    if check_dkx_cross(df_weekly, "已经上穿"): 
+                        reasons.append("周线金叉")
+                    else: 
+                        match = False
+                        
                 if match and cond3:
-                    if check_macd_increasing(df_daily, 3): reasons.append("日线MACD递增")
-                    else: match = False
+                    if check_macd_increasing(df_daily, 3): 
+                        reasons.append("日线MACD递增")
+                    else: 
+                        match = False
+                        
                 if match and cond4:
-                    if check_macd_increasing(df_weekly, 3): reasons.append("周线MACD递增")
-                    else: match = False
+                    if check_macd_increasing(df_weekly, 3): 
+                        reasons.append("周线MACD递增")
+                    else: 
+                        match = False
+                        
                 if match and cond5:
-                    if check_macd_increasing(df_monthly, 3): reasons.append("月线MACD递增")
-                    else: match = False
+                    if check_macd_increasing(df_monthly, 3): 
+                        reasons.append("月线MACD递增")
+                    else: 
+                        match = False
+                        
                 if match and cond6:
-                    if check_volume_ratio_increase(df_daily, 3, 1.0): reasons.append("量比>1")
-                    else: match = False
+                    if check_volume_ratio_increase(df_daily, 3, 1.0): 
+                        reasons.append("量比>1")
+                    else: 
+                        match = False
                 
                 if match:
                     last, prev = df_daily.iloc[-1], df_daily.iloc[-2]
                     change_pct = ((last['收盘'] - prev['收盘']) / prev['收盘']) * 100
                     results.append({
-                        '代码': code, '名称': name,
+                        '代码': code, 
+                        '名称': name,
                         '最新价': round(last['收盘'], 2),
                         '涨跌幅': f"{change_pct:+.2f}%",
                         '匹配条件': " · ".join(reasons)
@@ -326,7 +371,7 @@ if execute_btn:
                 continue
                 
         status.text("筛选完成！")
-        progress.empty()
+        progress.clear()
         
         st.subheader(f"🎯 选出 {len(results)} 只股票")
         if results:
