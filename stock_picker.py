@@ -295,6 +295,8 @@ if execute_btn:
                 stock_list['市值(万元)'] = stock_list['代码'].map(mv_dict)
                 stock_list = stock_list.dropna(subset=['市值(万元)'])
                 stock_list = stock_list[(stock_list['市值(万元)'] >= min_mv) & (stock_list['市值(万元)'] <= max_mv)]
+        # ================= 关键修复：重置索引，保证进度条顺序正确 =================
+        stock_list = stock_list.reset_index(drop=True)
 
         # ================= 正式选股 =================
         total = len(stock_list)
