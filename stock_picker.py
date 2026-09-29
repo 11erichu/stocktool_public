@@ -222,47 +222,55 @@ if execute_btn:
         stock_list = get_stock_list(token_input)
         if stock_list.empty: st.stop()
         
-        # ================= 关键修改：在循环外先进行初步筛选 =================
-        with st.spinner("正在进行初步筛选（市值、ST状态）..."):
-            try:
-                pro = ts.pro_api(token_input)
-                today = datetime.datetime.now().strftime('%Y%m%d')
-                
-                # 1. 获取市值
-                mv_df = pro.daily_basic(trade_date=today, fields='ts_code,total_mv')
-                if mv_df is not None and not mv_df.empty:
-                    mv_df['代码'] = mv_df['ts_code'].str[:6]
-                    mv_dict = dict(zip(mv_df['代码'], mv_df['total_mv']))
-                else:
-                    mv_dict = {}
-                
-                # 2. 获取ST名单 (直接通过名称过滤)
-                if exclude_st:
-                    st_df = pro.stock_basic(exchange='', list_status='L', fields='symbol,name')
-                    st_codes = set(st_df[st_df['name'].str.contains('ST')]['symbol'].tolist())
-                else:
-                    st_codes = set()
-                    
-            except Exception as e:
-                st.warning(f"获取市值或ST数据失败（可能是积分不足），将跳过初步筛选。错误：{e}")
-                mv_dict, st_codes = {}, set()
+        # ================= 关键修复：精确获取最新交易日 =================
+        with st.spinner("正在获取最新交易日及初步筛选数据..."):
+            pro = ts.pro_api(token_input)
+            
+            # 1. 获取最近的交易日（防止周末或节假日获取不到数据）
+            today_str = datetime.datetime.now().strftime('%Y%m%d')
+            start_search = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime('%Y%m%d')
+            cal_df = pro.trade_cal(exchange='SSE', is_open='1', start_date=start_search, end_date=today_str)
+            latest_trade_date = cal_df['cal_date'].max() if cal_df is not None and not cal_df.empty else today_str
+            
+            st.info(f"使用最近交易日: {latest_trade_date} 获取市值与ST数据...")
 
-            # 过滤 ST 股票
+            # 2. 获取市值
+            mv_df = pro.daily_basic(trade_date=latest_trade_date, fields='ts_code,total_mv')
+            if mv_df is not None and not mv_df.empty:
+                mv_df['代码'] = mv_df['ts_code'].str[:6]
+                mv_dict = dict(zip(mv_df['代码'], mv_df['total_mv']))
+            else:
+                mv_dict = {}
+                st.error(f"⚠️ 无法获取 {latest_trade_date} 的市值数据，请检查 Tushare 积分权限（daily_basic需2000积分）。")
+            
+            # 3. 获取ST名单
+            if exclude_st:
+                st_df = pro.stock_basic(exchange='', list_status='L', fields='symbol,name')
+                st_codes = set(st_df[st_df['name'].str.contains('ST')]['symbol'].tolist())
+            else:
+                st_codes = set()
+
+            # 4. 执行筛选
+            original_count = len(stock_list)
+            
             if exclude_st and st_codes:
                 stock_list = stock_list[~stock_list['代码'].isin(st_codes)]
             
-            # 过滤市值范围
             if mv_dict:
-                # 给 stock_list 加上市值列
                 stock_list['市值(万元)'] = stock_list['代码'].map(mv_dict)
-                # 剔除没有市值的股票（比如新股）
                 stock_list = stock_list.dropna(subset=['市值(万元)'])
-                # 按照市值范围筛选
                 stock_list = stock_list[(stock_list['市值(万元)'] >= min_mv) & (stock_list['市值(万元)'] <= max_mv)]
+            else:
+                st.warning("未成功获取市值数据，已跳过市值筛选！")
 
         # 此时总数已经是过滤后的数量了
         total = len(stock_list)
-        st.info(f"经过初步筛选后，共需扫描 {total} 只股票...")
+        st.success(f"初步筛选完成：从 {original_count} 只股票中筛选出 {total} 只符合市值/ST条件的股票。")
+        
+        if total == 0:
+            st.warning("没有股票符合初步筛选条件，请调整市值范围或取消排除ST选项。")
+            st.stop()
+            
         progress = st.progress(0)
         status = st.empty()
         results = []
@@ -272,6 +280,7 @@ if execute_btn:
             progress.progress((idx+1)/total)
             status.text(f"筛选: {name} ({code}) - {idx+1}/{total}")
             
+            # 下面保留你原有的选股逻辑
             file_path = os.path.join(DATA_DIR, f"{code}.xlsx")
             if not os.path.exists(file_path): continue
                 
